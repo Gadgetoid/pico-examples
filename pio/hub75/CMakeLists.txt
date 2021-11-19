@@ -9,7 +9,7 @@ target_compile_definitions(pio_hub75 PRIVATE
 	PICO_DEFAULT_UART_RX_PIN=29
 )
 
-target_link_libraries(pio_hub75 PRIVATE pico_stdlib hardware_pio pico_multicore)
+target_link_libraries(pio_hub75 PRIVATE pico_stdlib hardware_pio pico_multicore hardware_dma)
 pico_add_extra_outputs(pio_hub75)
 
 # add url via pico_set_program_url

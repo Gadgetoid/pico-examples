@@ -13,6 +13,8 @@
 #include "pico/multicore.h"
 #include "hardware/gpio.h"
 #include "hardware/pio.h"
+#include "hardware/dma.h"
+#include "hardware/irq.h"
 #include "hub75.pio.h"
 
 #define DATA_BASE_PIN 0
@@ -66,7 +68,18 @@ struct alignas(4) Pixel {
 Pixel front_buffer[WIDTH * HEIGHT];
 uint32_t back_buffer[WIDTH * HEIGHT * 2];
 
+uint dma_channel = 0;
 bool do_flip = false;
+uint bit = 0;
+uint row = 0;
+
+PIO pio = pio0;
+uint sm_data = 0;
+uint sm_row = 1;
+
+uint data_prog_offs = 0;
+uint row_prog_offs = 0;
+
 
 inline uint32_t millis() {
     return to_ms_since_boot(get_absolute_time());
@@ -157,6 +170,77 @@ void flip() {
     do_flip = true;
 }
 
+void __isr dma_complete() {
+    if (do_flip && bit == 0 && row == 0) {
+        memcpy((uint8_t *)back_buffer, (uint8_t *)front_buffer, WIDTH * HEIGHT * sizeof(Pixel));
+        do_flip = false;
+    }
+
+    if(dma_channel_get_irq0_status(dma_channel)) {
+        dma_channel_acknowledge_irq0(dma_channel);
+
+        // SM is finished when it stalls on empty TX FIFO (or, y'know, DMA callback)
+        //hub75_wait_tx_stall(pio, sm_data);
+
+        // Check that previous OEn pulse is finished, else things WILL get out of sequence
+        hub75_wait_tx_stall(pio, sm_row);
+
+        // Latch row data, pulse output enable for new row.
+        pio_sm_put_blocking(pio, sm_row, row | (3u * (1u << bit) << 5));
+
+        row++;
+
+        if(row == 32) {
+            row = 0;
+            bit++;
+            if (bit == 12) {
+                bit = 0;
+            }
+            hub75_data_rgb888_set_shift(pio, sm_data, data_prog_offs, bit);
+        }
+    }
+
+    dma_channel_set_trans_count(dma_channel, WIDTH * 4, false);
+    dma_channel_set_read_addr(dma_channel, &back_buffer[row * WIDTH * 4], true);
+}
+
+void hub75_start() {
+    // Needed for 64x64 register write
+    setup_pin(DATA_BASE_PIN + 0);
+    setup_pin(DATA_BASE_PIN + 1);
+    setup_pin(DATA_BASE_PIN + 2);
+    setup_pin(DATA_BASE_PIN + 3);
+    setup_pin(DATA_BASE_PIN + 4);
+    setup_pin(DATA_BASE_PIN + 5);
+    setup_pin(CLK_PIN);
+    setup_pin(STROBE_PIN);
+    setup_pin(OEN_PIN);
+
+    // Ridiculous register write nonsense for the FM6126A-based 64x64 matrix
+    FM6126A_write_register(0b1111111111111110, 12);
+    FM6126A_write_register(0b0000001000000000, 13);
+
+    data_prog_offs = pio_add_program(pio, &hub75_data_rgb888_program);
+    row_prog_offs = pio_add_program(pio, &hub75_row_program);
+    hub75_data_rgb888_program_init(pio, sm_data, data_prog_offs, DATA_BASE_PIN, CLK_PIN);
+    hub75_row_program_init(pio, sm_row, row_prog_offs, ROWSEL_BASE_PIN, ROWSEL_N_PINS, STROBE_PIN);
+
+    dma_channel = dma_claim_unused_channel(true);
+    dma_channel_config config = dma_channel_get_default_config(dma_channel);
+    channel_config_set_transfer_data_size(&config, DMA_SIZE_32);
+    channel_config_set_bswap(&config, false);
+    channel_config_set_dreq(&config, pio_get_dreq(pio, sm_data, true));
+    dma_channel_configure(dma_channel, &config, &pio->txf[sm_data], NULL, 0, false);
+    dma_channel_set_irq0_enabled(dma_channel, true);
+    irq_set_enabled(pio_get_dreq(pio, sm_data, true), true);
+    irq_set_exclusive_handler(DMA_IRQ_0, dma_complete);
+    irq_set_enabled(DMA_IRQ_0, true);
+
+    row = 0;
+    bit = 0;
+    dma_complete();
+}
+
 void core1_main() {
     // Needed for 64x64 register write
     setup_pin(DATA_BASE_PIN + 0);
@@ -173,12 +257,8 @@ void core1_main() {
     FM6126A_write_register(0b1111111111111110, 12);
     FM6126A_write_register(0b0000001000000000, 13);
 
-    PIO pio = pio0;
-    uint sm_data = 0;
-    uint sm_row = 1;
-
-    uint data_prog_offs = pio_add_program(pio, &hub75_data_rgb888_program);
-    uint row_prog_offs = pio_add_program(pio, &hub75_row_program);
+    data_prog_offs = pio_add_program(pio, &hub75_data_rgb888_program);
+    row_prog_offs = pio_add_program(pio, &hub75_row_program);
     hub75_data_rgb888_program_init(pio, sm_data, data_prog_offs, DATA_BASE_PIN, CLK_PIN);
     hub75_row_program_init(pio, sm_row, row_prog_offs, ROWSEL_BASE_PIN, ROWSEL_N_PINS, STROBE_PIN);
 
@@ -213,20 +293,13 @@ int main() {
     stdio_init_all();
 
     // Launch the display update routine on Core 1, it's hungry for cycles!
-    multicore_launch_core1(core1_main);
+    //multicore_launch_core1(core1_main);
+    hub75_start();
 
     // Basic loop to draw something to the screen.
     // This gets the distance from the middle of the display and uses it to paint a circular colour cycle.
     while (true) {
         float offset = millis() / 5000.0f;
-        /*for(auto x = 0u; x < WIDTH / 2; x++) {
-            for(auto y = 0u; y < HEIGHT / 2; y++) {
-                set_rgb(x, y, 255, 0, 0);
-                set_rgb(x + (WIDTH / 2), y, 0, 255, 0);
-                set_rgb(x, y + (HEIGHT / 2), 0, 0, 255);
-                set_rgb(x + (WIDTH / 2), y + (HEIGHT / 2), 255, 255, 0);
-            }
-        }*/
         for(auto x = 0u; x < WIDTH; x++) {
             for(auto y = 0u; y < HEIGHT; y++) {
                 // Center our rainbow circles
@@ -236,10 +309,18 @@ int main() {
                 float h = float(x1*x1 + y1*y1) / float(WIDTH*WIDTH + HEIGHT*HEIGHT);
                 // Offset our hue to animate the effect
                 h -= offset;
-                //float h = float(y) / float(HEIGHT);
-                //float h = float(x) / float(WIDTH);
                 set_hsv(x, y, h, 1.0f, 1.0f);
             }
+
+            // Monochrome gradient to verify gamma
+            for(auto y = 0u; y < 10; y++) {
+                set_rgb(x, y, x * 4, x * 4, x * 4);
+            }
+            set_rgb(x, 10, 0, 0, 0);
+
+            // X cross to verify pixel alignment
+            set_rgb(x, x, 255, 0, 0);
+            set_rgb(x, WIDTH - 1 - x, 255, 0, 0);
         }
 
         flip();
